@@ -16,6 +16,10 @@ import theano.tensor as T
 import re
 import warnings
 import sys
+from matplotlib.mlab import PCA
+import matplotlib.pyplot as plt
+
+
 warnings.filterwarnings("ignore")   
 
 #different non-linearities
@@ -78,6 +82,13 @@ def train_conv_net(datasets,
     zero_vec_tensor = T.vector()
     zero_vec = np.zeros(img_w)
     set_zero = theano.function([zero_vec_tensor], updates=[(Words, T.set_subtensor(Words[0,:], zero_vec_tensor))])
+    #I have re-used the code below to produce the vector representations of the sentences. "layer0_input" takes the 
+	#Word embeddings and paddings to build a matrix. This matrix is used as an input to the bottom convolutional
+	#layer. The input matrix representation of each sentence is then forwarded through all convolutional layers,
+	#until it reaches the classifier, which consists of a drop-out layer and a softmax layer. By using stochastic 
+	#gradient descent, we then use the error of the classification to update all parameters (in some cases, even 
+	#the word embeddings. For this task we use the "dense" layer, called "layer1_input" in this code, which is used 
+	#to predict the sentiment of each review.
     layer0_input = Words[T.cast(x.flatten(),dtype="int32")].reshape((x.shape[0],1,x.shape[1],Words.shape[1]))                                  
     conv_layers = []
     layer1_inputs = []
@@ -85,7 +96,7 @@ def train_conv_net(datasets,
         filter_shape = filter_shapes[i]
         pool_size = pool_sizes[i]
         conv_layer = LeNetConvPoolLayer(rng, input=layer0_input,image_shape=(batch_size, 1, img_h, img_w),
-                                filter_shape=filter_shape, poolsize=pool_size, non_linear=conv_non_linear)
+                     filter_shape=filter_shape, poolsize=pool_size, non_linear=conv_non_linear)
         layer1_input = conv_layer.output.flatten(2)
         conv_layers.append(conv_layer)
         layer1_inputs.append(layer1_input)
@@ -129,12 +140,11 @@ def train_conv_net(datasets,
          givens={
             x: val_set_x[index * batch_size: (index + 1) * batch_size],
             y: val_set_y[index * batch_size: (index + 1) * batch_size]})
-            
     #compile theano functions to get train/val/test errors
     test_model = theano.function([index], classifier.errors(y),
              givens={
                 x: train_set_x[index * batch_size: (index + 1) * batch_size],
-                y: train_set_y[index * batch_size: (index + 1) * batch_size]})               
+				y: train_set_y[index * batch_size: (index + 1) * batch_size]})               
     train_model = theano.function([index], cost, updates=grad_updates,
           givens={
             x: train_set_x[index*batch_size:(index+1)*batch_size],
@@ -149,7 +159,6 @@ def train_conv_net(datasets,
     test_y_pred = classifier.predict(test_layer1_input)
     test_error = T.mean(T.neq(test_y_pred, y))
     test_model_all = theano.function([x,y], test_error)   
-    
     #start training over mini-batches
     print '... training'
     epoch = 0
@@ -172,11 +181,16 @@ def train_conv_net(datasets,
         val_losses = [val_model(i) for i in xrange(n_val_batches)]
         val_perf = 1- np.mean(val_losses)                        
         print('epoch %i, train perf %f %%, val perf %f' % (epoch, train_perf * 100., val_perf*100.))
+   #Instead of using a stopping criteria, I have chosen to use the parameters which performs the best on the 
+   #Validation data set. The parameters from the convolutional layers and the word embeddings for the best performing
+   #model are saved (as convo_save and Words_save)
         if val_perf >= best_val_perf:
             best_val_perf = val_perf
             test_loss = test_model_all(test_set_x,test_set_y)        
-            test_perf = 1- test_loss         
-    return test_perf
+            test_perf = 1-test_loss    
+            convo_save=conv_layers
+            Words_save=Words
+    return test_perf, convo_save, Words_save
 
 def shared_dataset(data_xy, borrow=True):
         """ Function that loads the dataset into shared variables
@@ -267,8 +281,8 @@ def make_idx_data_cv(revs, word_idx_map, cv, max_l=51, k=300, filter_h=5):
     Transforms sentences into a 2-d matrix.
     """
     train, test = [], []
-    for rev in revs:
-        sent = get_idx_from_sent(rev["text"], word_idx_map, max_l, k, filter_h)   
+    for i,rev in enumerate(revs):
+        sent = get_idx_from_sent(rev["text"], word_idx_map, max_l, k, filter_h)  
         sent.append(rev["y"])
         if rev["split"]==cv:            
             test.append(sent)        
@@ -277,44 +291,96 @@ def make_idx_data_cv(revs, word_idx_map, cv, max_l=51, k=300, filter_h=5):
     train = np.array(train,dtype="int")
     test = np.array(test,dtype="int")
     return [train, test]     
-  
+ 
+
+
+#This program will take an unprocessed sentence and transform it into a 300X1 vector representation
+#based on the predictions of the convolutional neural network. We use the convolutional layers trained in the
+#CNN-model to extract a feature vector.
+def sentence_vector(sentence, word_idx_map, Words, convo_layers, max_l=51, k=300, filter_h=5):
+	#Transform sentence into integers and padding.
+	sent = get_idx_from_sent(sentence, word_idx_map, max_l, k, filter_h)
+	sent=np.array(sent).reshape((1,len(sent)))
+	#Use the integers to find the right word embeddings used for the CNN.
+	x=T.matrix()
+	layer0_input=Words[T.cast(x.flatten(),dtype="int32")].reshape((x.shape[0],1,x.shape[1],Words.shape[1]))
+	#In the same way as in the CNN model, we use the word embedding matrix as input bottom layer,
+	#and then go through all convolutional layers to until we reach the "dense" layer, as described in
+	#http://blog.christianperone.com/2015/08/convolutional-neural-networks-and-feature-extraction-with-python/
+	#This will give a 300X1 vector, which was used for prediction in the CNN, before applying dropout
+	#and the final softmax-layer. We can use this to get a vector representation of a sentence or review, and then 
+	#find it's relative position in a vector space.  
+	pred_layers=[]
+	for conv_layer in convo_layers:
+		layer0_output = conv_layer.predict(layer0_input, 1)
+		pred_layers.append(layer0_output.flatten(2))
+	layer1_input = T.concatenate(pred_layers, 1)	
+	get_rep=theano.function([x],layer1_input)
+	return get_rep(sent)
+
+
+#This program will transform all of the review corpora into vector representations.
+#We use the similar code for prediction as in "def sentence_vector" and "def train_conv_net", but it is slightly
+#modified in order to handle more reviews.	
+def corpus_vector(revs, word_idx_map, W, convo_layers, max_l=51, k=300, filter_h=5):
+	revs_total=np.vstack((datasets[0],datasets[1]))
+	text=revs_total[:,:-1]
+	labels=revs_total[:,-1]
+	x=T.matrix()
+	#test_size=T.scalar()
+	layer0_input_all = W[T.cast(x.flatten(),dtype="int32")].reshape((x.shape[0],1,x.shape[1],W.shape[1]))
+	pred_layers=[]
+	for conv_layer in convo_layers:
+		layer0_output_all = conv_layer.predict(layer0_input_all, text.shape[0])
+		pred_layers.append(layer0_output_all.flatten(2))
+	layer1_input = T.concatenate(pred_layers, 1)	
+	get_rep=theano.function([x],layer1_input)
+	return get_rep(text),labels
+
+
+
+
+	
    
 if __name__=="__main__":
     print "loading data...",
     x = cPickle.load(open("mr.p","rb"))
     revs, W, W2, word_idx_map, vocab = x[0], x[1], x[2], x[3], x[4]
-    print "data loaded!"
-    mode= sys.argv[1]
-    word_vectors = sys.argv[2]    
-    if mode=="-nonstatic":
-        print "model architecture: CNN-non-static"
-        non_static=True
-    elif mode=="-static":
-        print "model architecture: CNN-static"
-        non_static=False
-    execfile("conv_net_classes.py")    
-    if word_vectors=="-rand":
-        print "using: random vectors"
-        U = W2
-    elif word_vectors=="-word2vec":
-        print "using: word2vec vectors"
-        U = W
-    results = []
-    r = range(0,10)    
-    for i in r:
-        datasets = make_idx_data_cv(revs, word_idx_map, i, max_l=56,k=300, filter_h=5)
-        perf = train_conv_net(datasets,
-                              U,
-                              lr_decay=0.95,
-                              filter_hs=[3,4,5],
-                              conv_non_linear="relu",
-                              hidden_units=[100,2], 
-                              shuffle_batch=True, 
-                              n_epochs=25, 
-                              sqr_norm_lim=9,
-                              non_static=non_static,
-                              batch_size=50,
-                              dropout_rate=[0.5])
-        print "cv: " + str(i) + ", perf: " + str(perf)
-        results.append(perf)  
-    print str(np.mean(results))
+    mode=sys.argv[1]
+    word_vectors = sys.argv[2] 
+    if mode=="-build_representations":
+		pass
+    else:
+		if mode=="-nonstatic":
+			print "model architecture: CNN-non-static"
+			non_static=True
+		elif mode=="-static":
+			print "model architecture: CNN-static"
+			non_static=False
+		execfile("conv_net_classes.py")    
+		if word_vectors=="-rand":
+			print "using: random vectors"
+			U = W2
+		elif word_vectors=="-word2vec":
+			print "using: word2vec vectors"
+			U = W
+		#As we are using the CNN to build representations, I have modified to code to run the model once.
+		#To avoid overfitting, I have chosen to use parameters of the model which gives the best result on the 
+		#Validation data set. 
+		datasets = make_idx_data_cv(revs, word_idx_map, 0, max_l=56,k=300, filter_h=5)		
+		perf, convo_save, Words_save = train_conv_net(datasets, U, lr_decay=0.95,filter_hs=[3,4,5],
+		conv_non_linear="relu", 
+		hidden_units=[100,2], 
+		shuffle_batch=True, 
+		n_epochs=25, 
+		sqr_norm_lim=9,
+		non_static=non_static, 
+					batch_size=50, 
+					dropout_rate=[0.5])			  
+		print "perf: " + str(perf)
+		#Build a vector representation of the first review
+		sentence_representation=sentence_vector(revs[0]['text'], word_idx_map, Words_save, convo_save, max_l=56, k=300, filter_h=5)
+		print sentence_representation
+		#Build vector representations of all reviews
+		corpus_representations, labels=corpus_vector(revs, word_idx_map, Words_save, convo_save, max_l=51, k=300, filter_h=5)
+		print sentence_representation.shape	
